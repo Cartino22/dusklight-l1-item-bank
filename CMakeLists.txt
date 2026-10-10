@@ -24,5 +24,4 @@ add_mod(l1_item_bank
         FEATURES game
         SOURCES src/mod.cpp
         MOD_JSON "${CMAKE_CURRENT_BINARY_DIR}/mod.json"
-        RES_DIR res            # mod resources, including icon.png and banner.png
 )
