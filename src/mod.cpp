@@ -20,13 +20,18 @@
 #include "d/actor/d_a_alink.h"
 #include "d/d_com_inf_game.h"
 #include "d/d_item_data.h"
+#include "d/d_meter2_draw.h"
 #include "d/d_meter2_info.h"
+#include "d/d_meter_HIO.h"
+#include "d/d_pane_class.h"
+#include "JSystem/J2DGraph/J2DPicture.h"
 #include "d/d_msg_object.h"
 #include "d/d_save.h"
 #include "m_Do/m_Do_controller_pad.h"
 
 #include <dolphin/pad.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -41,6 +46,11 @@ IMPORT_SERVICE(UiService, svc_ui);
 
 // Runs when the game copies its state into a save buffer (manual saves and autosave).
 DEFINE_HOOK(&dSv_info_c::memory_to_card, MemoryToCard);
+
+// HUD hooks, used only to keep the X/Y buttons from flickering when a HUD layout mod
+// (e.g. TP Classic Modern Controller UI) is installed. See "HUD layout mods" below.
+DEFINE_HOOK(&dMeter2Draw_c::drawButtonXY, MeterDrawButtonXY);
+DEFINE_HOOK(&dMeter2Draw_c::draw, MeterDraw);
 
 namespace {
 
@@ -451,6 +461,108 @@ bool restore_allowed() {
     return true;
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// HUD layout mods
+//
+// When an X/Y item changes, the game's drawButtonXY puts the X/Y buttons and icons back at their
+// stock positions. Mods that rearrange the HUD (TP Classic Modern Controller UI) move them again,
+// but only after the HUD has been drawn, so for one frame the buttons appear at the stock spot.
+// After a swap, this hides those X/Y elements for that one draw. It only kicks in when the
+// buttons are found away from their stock position, i.e. when a layout mod is active.
+
+int s_swapHudFrames = 0;          // frames after a swap during which a HUD refresh is ours
+bool s_hudLayoutModded = false;   // last frame, X sat somewhere other than its stock position
+bool s_hideXY[2] = {false, false};
+
+struct HiddenPane {
+    J2DPane* pane;
+    bool wasVisible;
+};
+HiddenPane s_hidden[16];
+int s_hiddenCount = 0;
+
+J2DPane* pane_of(CPaneMgr* mgr) {
+    return mgr != nullptr ? mgr->getPanePtr() : nullptr;
+}
+
+void hide_for_draw(J2DPane* pane) {
+    if (pane == nullptr || s_hiddenCount >= static_cast<int>(sizeof(s_hidden) / sizeof(s_hidden[0]))) {
+        return;
+    }
+    s_hidden[s_hiddenCount++] = {pane, pane->isVisible()};
+    pane->hide();
+}
+
+void after_draw_button_xy(ModContext*, void* args, void*, void*) {
+    const int slot = mods::arg<int>(args, 1);
+    if (slot >= 0 && slot < 2 && s_swapHudFrames > 0 && s_hudLayoutModded) {
+        s_hideXY[slot] = true;
+    }
+}
+
+HookAction before_meter_draw(ModContext*, void* args, void*, void*) {
+    s_hiddenCount = 0;
+    auto* meter = mods::arg<dMeter2Draw_c*>(args, 0);
+    if (meter == nullptr) {
+        return HOOK_CONTINUE;
+    }
+    for (int i = 0; i < 2; ++i) {
+        if (!s_hideXY[i]) {
+            continue;
+        }
+        hide_for_draw(pane_of(meter->mpButtonXY[i]));
+        hide_for_draw(pane_of(meter->mpLightXY[i]));
+        hide_for_draw(pane_of(meter->mpItemXY[i]));
+        hide_for_draw(pane_of(meter->mpTextXY[i]));
+        hide_for_draw(meter->mpItemXYPane[i]);
+        for (int j = 0; j < 3; ++j) {
+            hide_for_draw(meter->mpItemNumTex[i][j]);  // ammo digits
+        }
+    }
+    return HOOK_CONTINUE;
+}
+
+// Registered to run after other mods' post-draw hooks, so the layout mod has already moved
+// the buttons back by the time we look.
+void after_meter_draw(ModContext*, void* args, void*, void*) {
+    for (int i = 0; i < s_hiddenCount; ++i) {
+        if (s_hidden[i].wasVisible) {
+            s_hidden[i].pane->show();
+        }
+    }
+    s_hiddenCount = 0;
+    s_hideXY[0] = s_hideXY[1] = false;
+
+    auto* meter = mods::arg<dMeter2Draw_c*>(args, 0);
+    CPaneMgr* x = meter != nullptr ? meter->mpButtonXY[0] : nullptr;
+    if (x == nullptr || x->getPanePtr() == nullptr) {
+        return;
+    }
+    // Where drawButtonXY would have put the X button (CPaneMgr::paneTrans + scale).
+    const f32 stockX = g_drawHIO.mButtonXPosX + x->getInitCenterPosX() - x->getSizeX() * 0.5f;
+    const f32 stockY = g_drawHIO.mButtonXPosY + x->getInitCenterPosY() - x->getSizeY() * 0.5f;
+    J2DPane* pane = x->getPanePtr();
+    s_hudLayoutModded = std::fabs(x->getPosX() - stockX) > 0.5f ||
+                        std::fabs(x->getPosY() - stockY) > 0.5f ||
+                        std::fabs(pane->getScaleX() - g_drawHIO.mButtonXScale) > 0.01f;
+}
+
+ModResult install_hud_hooks() {
+    HookOptions early = HOOK_OPTIONS_INIT;
+    early.priority = 1000;
+    HookOptions late = HOOK_OPTIONS_INIT;
+    late.priority = -1000;
+    ModResult result = mods::hook::add_post<MeterDrawButtonXY>(after_draw_button_xy);
+    if (result == MOD_OK) {
+        result = mods::hook::add_pre<MeterDraw>(before_meter_draw, &early);
+    }
+    if (result == MOD_OK) {
+        result = mods::hook::add_post<MeterDraw>(after_meter_draw, &late);
+    }
+    return result;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Swapping
 
@@ -470,6 +582,7 @@ void swap_banks(bool notify) {
     write_live_pair(sanitize(s_stored));
     s_stored = live;
     s_secondActive = !s_secondActive;
+    s_swapHudFrames = 3;  // the HUD picks the change up within the next frame or two
     if (notify) {
         notify_switch();
     }
@@ -602,6 +715,11 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         return mods::set_error(error, result, "could not hook the game's save routine");
     }
 
+    // Cosmetic only: if these can't be installed, swapping still works.
+    if (install_hud_hooks() != MOD_OK) {
+        svc_log->warn(mod_ctx, "HUD hooks unavailable; X/Y may flicker with HUD layout mods");
+    }
+
     result = svc_save->observe_saves(
         mod_ctx, on_new_save, on_save_loaded, on_save_written, nullptr, &s_saveObserver);
     if (result != MOD_OK) {
@@ -622,6 +740,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 }
 
 MOD_EXPORT ModResult mod_update(ModError*) {
+    if (s_swapHudFrames > 0) {
+        --s_swapHudFrames;
+    }
     const bool down = l1_down();
     const bool pressed = down && !s_l1WasDown;
     s_l1WasDown = down;
