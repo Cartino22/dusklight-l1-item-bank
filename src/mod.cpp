@@ -1,14 +1,14 @@
-// L1 Item Bank: a second pair of X/Y items, switched with L1.
+// L1 Item Bank: a second set of X/Y/Z items, switched with L1.
 //
-// The mod never adds a new button slot. It keeps a second (X, Y) pair and swaps it into the
-// game's own X/Y slots, so the HUD, the item wheel, combo items (bomb arrows, etc.) and ammo
-// counters all keep working through the game's normal code. The Z slot (select index 2, used by
-// Twilit Essentials / Dawnlight) is never touched.
+// The mod never adds a new button slot. It keeps a second (X, Y, Z) set and swaps it into the
+// game's own select-item slots, so the HUD, the item wheel, combo items (bomb arrows, etc.) and
+// ammo counters all keep working through the game's normal code. Z is select index 2, which is
+// where Twilit Essentials' Custom Z Button (and Dawnlight's Z slot) keep the third item.
 //
-// Persistence: both pairs are written to the save slot only when the game itself writes a save
+// Persistence: both sets are written to the save slot only when the game itself writes a save
 // (snapshot taken when the save data is captured, stored once the slot is known), so the stored
-// pairs always match the X/Y the card holds. On load, the live X/Y are matched against the
-// stored pairs to work out which pair is on the buttons.
+// sets always match what the card holds. On load, the live X/Y/Z are matched against the stored
+// sets to work out which set is on the buttons.
 
 #include "mods/service.hpp"
 #include "mods/svc/config.h"
@@ -29,6 +29,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 
 DEFINE_MOD();
 
@@ -46,14 +47,16 @@ namespace {
 // ---------------------------------------------------------------------------------------------
 // Constants
 
-constexpr int kBankSlots = 2;        // X and Y (SELECT_ITEM_X = 0, SELECT_ITEM_Y = 1)
+constexpr int kBankSlots = 3;        // X, Y and Z (select indexes 0, 1 and 2)
+constexpr int kLegacyBankSlots = 2;  // v2 saves stored X and Y only
 constexpr u8 kEmptySlot = 0xFF;      // "no item" for select/mix slot indexes
 constexpr int kSdlLeftShoulder = 9;  // SDL3 SDL_GAMEPAD_BUTTON_LEFT_SHOULDER (L1 / LB)
 constexpr u32 kModeAiming = 0x20000000;  // set by the bow/clawshot/boomerang/... aiming procs
 constexpr u32 kModeItemsUsable = 0x4;    // the state where X/Y may change Link's held item
 constexpr const char* kBlobName = "pairs";
 constexpr uint32_t kBlobMagic = 0x4C314942;  // "L1IB"
-constexpr uint32_t kBlobVersion = 2;
+constexpr uint32_t kBlobVersion = 3;
+constexpr uint32_t kLegacyBlobVersion = 2;
 
 enum Mode : int64_t {
     MODE_TOGGLE = 0,
@@ -66,8 +69,8 @@ const char* const kModeOptions[] = {"Toggle (tap L1)", "Hold (while L1 is held)"
 // State
 
 struct Pair {
-    u8 select[kBankSlots] = {kEmptySlot, kEmptySlot};
-    u8 mix[kBankSlots] = {kEmptySlot, kEmptySlot};
+    u8 select[kBankSlots] = {kEmptySlot, kEmptySlot, kEmptySlot};
+    u8 mix[kBankSlots] = {kEmptySlot, kEmptySlot, kEmptySlot};
 
     bool operator==(const Pair& other) const {
         for (int i = 0; i < kBankSlots; ++i) {
@@ -95,10 +98,23 @@ struct PairsBlob {
     uint8_t secondMix[kBankSlots];
     uint8_t reserved[3];
 };
-static_assert(sizeof(PairsBlob) == 20, "PairsBlob layout changed");
+static_assert(sizeof(PairsBlob) == 24, "PairsBlob layout changed");
+
+// Version 1.0.0 of the mod stored X and Y only.
+struct LegacyPairsBlob {
+    uint32_t magic;
+    uint32_t version;
+    uint8_t secondActive;
+    uint8_t mainSelect[kLegacyBankSlots];
+    uint8_t mainMix[kLegacyBankSlots];
+    uint8_t secondSelect[kLegacyBankSlots];
+    uint8_t secondMix[kLegacyBankSlots];
+    uint8_t reserved[3];
+};
+static_assert(sizeof(LegacyPairsBlob) == 20, "LegacyPairsBlob layout changed");
 
 Pair s_stored;               // the pair currently sitting outside the game's X/Y slots
-bool s_secondActive = false; // true while the second pair is on X/Y
+bool s_secondActive = false; // true while the second set is on the buttons
 bool s_stateLoaded = false;  // our state matches the active save slot
 bool s_needSync = true;      // re-match the live X/Y against the save slot once Link exists
 
@@ -196,9 +212,18 @@ Pair sanitize(Pair pair) {
 }
 
 void write_live_pair(const Pair& pair) {
+    // Write every slot first, so nothing that reacts to a slot change (the HUD, Twilit
+    // Essentials' duplicate-item handling) ever sees a half-swapped set, e.g. the new X next to
+    // the old Y.
+    dSv_player_status_a_c& status = g_dComIfG_gameInfo.info.getPlayer().getPlayerStatusA();
     for (int i = 0; i < kBankSlots; ++i) {
-        dComIfGs_setMixItemIndex(i, pair.mix[i]);
-        dComIfGs_setSelectItemIndex(i, pair.select[i]);  // also refreshes the play-side item
+        status.setMixItemIndex(i, pair.mix[i]);
+        status.setSelectItemIndex(i, pair.select[i]);
+    }
+    // Then commit through the same call the item wheel uses, so the play-side items and any
+    // mod hooks on it (Twilit Essentials' Z button) update as they would after a normal assign.
+    for (int i = 0; i < kBankSlots; ++i) {
+        dComIfGs_setSelectItemIndex(i, pair.select[i]);
     }
 }
 
@@ -226,33 +251,56 @@ void store_snapshot(const Snapshot& snap) {
         blob.secondMix[i] = snap.second.mix[i];
     }
     if (svc_save->set_blob(mod_ctx, kBlobName, &blob, sizeof(blob)) != MOD_OK) {
-        svc_log->warn(mod_ctx, "could not store the item pairs with this save");
+        svc_log->warn(mod_ctx, "could not store the item sets with this save");
     }
 }
 
 // Works out which pair is on X/Y right now, using the pairs stored with the save.
 void sync_with_save() {
     const Pair live = read_live_pair();
+    Pair main;
+    Pair second;
+    bool savedSecondActive = false;
+
     PairsBlob blob{};
     size_t size = sizeof(blob);
-    if (svc_save->get_blob(mod_ctx, kBlobName, &blob, &size) != MOD_OK ||
-        size != sizeof(blob) || blob.magic != kBlobMagic || blob.version != kBlobVersion)
+    const bool haveBlob = svc_save->get_blob(mod_ctx, kBlobName, &blob, &size) == MOD_OK;
+    if (haveBlob && size == sizeof(PairsBlob) && blob.magic == kBlobMagic &&
+        blob.version == kBlobVersion)
     {
-        // A file that has never been saved with the mod: X/Y are the main pair.
+        for (int i = 0; i < kBankSlots; ++i) {
+            main.select[i] = blob.mainSelect[i];
+            main.mix[i] = blob.mainMix[i];
+            second.select[i] = blob.secondSelect[i];
+            second.mix[i] = blob.secondMix[i];
+        }
+        savedSecondActive = blob.secondActive != 0;
+    } else if (haveBlob && size == sizeof(LegacyPairsBlob)) {
+        // Saved by 1.0.0, which left Z alone: both sets start out sharing the current Z item.
+        LegacyPairsBlob legacy{};
+        std::memcpy(&legacy, &blob, sizeof(legacy));
+        if (legacy.magic != kBlobMagic || legacy.version != kLegacyBlobVersion) {
+            s_secondActive = false;
+            s_stored = Pair{};
+            return;
+        }
+        for (int i = 0; i < kLegacyBankSlots; ++i) {
+            main.select[i] = legacy.mainSelect[i];
+            main.mix[i] = legacy.mainMix[i];
+            second.select[i] = legacy.secondSelect[i];
+            second.mix[i] = legacy.secondMix[i];
+        }
+        for (int i = kLegacyBankSlots; i < kBankSlots; ++i) {
+            main.select[i] = second.select[i] = live.select[i];
+            main.mix[i] = second.mix[i] = live.mix[i];
+        }
+        savedSecondActive = legacy.secondActive != 0;
+    } else {
+        // A file that has never been saved with the mod: the buttons hold the main set.
         s_secondActive = false;
         s_stored = Pair{};
         return;
     }
-
-    Pair main;
-    Pair second;
-    for (int i = 0; i < kBankSlots; ++i) {
-        main.select[i] = blob.mainSelect[i];
-        main.mix[i] = blob.mainMix[i];
-        second.select[i] = blob.secondSelect[i];
-        second.mix[i] = blob.secondMix[i];
-    }
-    const bool savedSecondActive = blob.secondActive != 0;
     const Pair& savedActive = savedSecondActive ? second : main;
     const Pair& savedOther = savedSecondActive ? main : second;
 
@@ -412,7 +460,7 @@ void notify_switch() {
     }
     UiToastDesc toast = UI_TOAST_DESC_INIT;
     toast.title_rml = "L1 Item Bank";
-    toast.body_rml = s_secondActive ? "Second item pair" : "Main item pair";
+    toast.body_rml = s_secondActive ? "Second item set" : "Main item set";
     toast.duration_ms = 1200;
     svc_ui->push_toast(mod_ctx, &toast);
 }
@@ -448,9 +496,9 @@ void refresh_panel_text() {
         svc_ui->elem_set_text(mod_ctx, s_conflictText, text);
     }
     if (s_statusText != 0) {
-        const char* status = !s_stateLoaded  ? "Load a save to use the second pair."
-                             : s_secondActive ? "Second pair is on X/Y right now."
-                                              : "Main pair is on X/Y right now.";
+        const char* status = !s_stateLoaded  ? "Load a save to use the second set."
+                             : s_secondActive ? "Second set is on X/Y/Z right now."
+                                              : "Main set is on X/Y/Z right now.";
         svc_ui->elem_set_text(mod_ctx, s_statusText, status);
     }
 }
@@ -468,7 +516,7 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     mode.config_var = s_modeVar;
     mode.options = kModeOptions;
     mode.option_count = sizeof(kModeOptions) / sizeof(kModeOptions[0]);
-    mode.tooltip = "Toggle: tap L1 to flip pairs. Hold: second pair only while L1 is held.";
+    mode.tooltip = "Toggle: tap L1 to flip sets. Hold: second set only while L1 is held.";
     ModResult result = svc_ui->pane_add_control(mod_ctx, panel, &mode, nullptr);
     if (result != MOD_OK) {
         return result;
@@ -486,10 +534,10 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
 
     svc_ui->pane_add_section(mod_ctx, panel, "How to use");
     svc_ui->pane_add_text(mod_ctx, panel,
-        "Switch to the second pair with L1, then open the item wheel and assign items to X and Y "
-        "as usual. Those become your second pair. Switch back and your main pair returns. "
-        "In Hold mode, keep L1 held while opening the item wheel to edit the second pair. "
-        "Both pairs are kept with each save file when you save.",
+        "Switch to the second set with L1, then open the item wheel and assign items to X, Y "
+        "and Z as usual. Those become your second set. Switch back and your main set returns. "
+        "In Hold mode, keep L1 held while opening the item wheel to edit the second set. "
+        "Both sets are kept with each save file when you save.",
         nullptr);
     svc_ui->pane_add_text(mod_ctx, panel,
         "Switching waits while you aim, use an item, or are in a menu or cutscene.", nullptr);
